@@ -1351,23 +1351,42 @@ class InventoryOverview:
             master,
             scrollregion=(0, 0, 0, 0),
             yscrollincrement=32,
+            # FIX: sans ça, l'anneau de focus (2px de chaque côté) rend la
+            # zone visible 4px plus étroite que la scrollregion -> xview ne
+            # vaut jamais (0.0, 1.0) -> barre fantôme + micro-scroll.
+            highlightthickness=0,
+            borderwidth=0,
         )
         self._canvas.grid(column=0, row=1, sticky="nsew")
         master.rowconfigure(1, weight=1)
         master.columnconfigure(0, weight=1)
-        xscroll = ttk.Scrollbar(master, orient="horizontal", command=self._canvas.xview)
-        xscroll.grid(column=0, row=2, sticky="ew")
+        self._xscroll = ttk.Scrollbar(master, orient="horizontal", command=self._canvas.xview)
+        self._xscroll.grid(column=0, row=2, sticky="ew")
         self._yscroll = ttk.Scrollbar(master, orient="vertical", command=self._canvas.yview)
         self._yscroll.grid(column=1, row=1, sticky="ns")
         self._canvas.configure(
-            xscrollcommand=xscroll.set,
+            xscrollcommand=self._on_xscroll,
             yscrollcommand=self._on_yscroll,
         )
         self._canvas.bind("<Configure>", self._canvas_update)
+        # FIX perso: sur Linux il n'y a pas d'événement <MouseWheel>,
+        # la molette envoie Button-4 (haut) / Button-5 (bas).
         self._canvas.bind(
-            "<Enter>", lambda e: self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+            "<Enter>",
+            lambda e: (
+                self._canvas.bind_all("<MouseWheel>", self._on_mousewheel),
+                self._canvas.bind_all("<Button-4>", self._on_mousewheel),
+                self._canvas.bind_all("<Button-5>", self._on_mousewheel),
+            ),
         )
-        self._canvas.bind("<Leave>", lambda e: self._canvas.unbind_all("<MouseWheel>"))
+        self._canvas.bind(
+            "<Leave>",
+            lambda e: (
+                self._canvas.unbind_all("<MouseWheel>"),
+                self._canvas.unbind_all("<Button-4>"),
+                self._canvas.unbind_all("<Button-5>"),
+            ),
+        )
 
         # Model/render state. None frame/status/window means the campaign exists
         # logically but currently has no Tk widgets allocated.
@@ -1382,6 +1401,9 @@ class InventoryOverview:
         self._render_tasks: dict[DropsCampaign, asyncio.Task[None]] = {}
         self._generation = 0
         self._max_campaign_width = 0
+        # FIX perso: pas de scroll uniforme basé sur une hauteur estimée.
+        # Les cartes hautes (ex. longue liste ACL) étaient coupées en bas.
+        self._row_stride = self.ROW_STRIDE
 
         self._layout_after: str | None = None
         self._canvas_update_after: str | None = None
@@ -1405,9 +1427,15 @@ class InventoryOverview:
             and (not_linked or campaign.eligible)
             and (campaign.active or upcoming and campaign.upcoming or expired and campaign.expired)
             and (
-                excluded or (
+                excluded
+                # FIX perso: parenthésage explicite. Avant, en mode Priority
+                # Only, un jeu à la fois exclu ET prioritaire restait affiché
+                # (le `or` avalait l'exclusion). Exclu gagne toujours.
+                or (
                     campaign.game.name not in self._settings.exclude
-                    and not priority_only or campaign.game.name in self._settings.priority
+                    and (
+                        not priority_only or campaign.game.name in self._settings.priority
+                    )
                 )
             )
             and (finished or not campaign.finished)
@@ -1471,6 +1499,22 @@ class InventoryOverview:
         self._visible_campaigns = visible
         self._visible_rows = {campaign: row for row, campaign in enumerate(visible)}
 
+        # FIX: ne recalcule largeur max et pas vertical que si le SET visible
+        # a vraiment changé (filtre coché/décoché...). Le reset à chaque rebuild
+        # créait une boucle reset -> remesure -> relayout -> reset qui saturait
+        # le CPU, figeait l'UI (croix morte) et vidait l'inventaire.
+        visible_set = set(visible)
+        if visible_set != getattr(self, "_last_visible_set", None):
+            self._last_visible_set = visible_set
+            # FIX: recalcule sur le set actuel, sinon une carte large/haute
+            # supprimée laisse des barres fantômes.
+            self._max_campaign_width = 0
+            self._row_stride = self.ROW_STRIDE
+            for campaign, display in list(self._campaigns.items()):
+                frame = display["frame"]
+                if frame is not None and frame.winfo_exists():
+                    self._measure_campaign(frame, self._generation)
+
         # Remove cards no longer represented in the filtered logical list and
         # reposition the handful of currently realized cards.
         for campaign, display in list(self._campaigns.items()):
@@ -1482,7 +1526,10 @@ class InventoryOverview:
                 self._canvas.coords(
                     display["window"],
                     0,
-                    row * self.ROW_STRIDE + self.CAMPAIGN_GAP // 2,
+                    row * self._row_stride + self.CAMPAIGN_GAP // 2,
+                )
+                self._canvas.itemconfigure(
+                    display["window"], height=self._row_stride - self.CAMPAIGN_GAP
                 )
 
         self._canvas_update()
@@ -1495,13 +1542,31 @@ class InventoryOverview:
     def _apply_canvas_update(self) -> None:
         self._canvas_update_after = None
         width = max(self._canvas.winfo_width(), self._max_campaign_width)
-        height = len(self._visible_campaigns) * self.ROW_STRIDE
+        height = len(self._visible_campaigns) * self._row_stride
         self._canvas.configure(scrollregion=(0, 0, width, height))
+        # FIX: synchronise les barres tout de suite. Les callbacks
+        # xscrollcommand/yscrollcommand ne se déclenchent pas toujours quand
+        # la région RÉTRÉCIT (ex. après décochage d'un filtre) : la barre
+        # restait visible alors que tout tenait déjà.
+        self._on_xscroll(*self._canvas.xview())
+        self._on_yscroll(*self._canvas.yview())
         self._schedule_virtualize()
 
     def _on_yscroll(self, first: str, last: str) -> None:
         self._yscroll.set(first, last)
+        # FIX: masque la barre quand tout tient à l'écran.
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self._yscroll.grid_remove()
+        else:
+            self._yscroll.grid()
         self._schedule_virtualize()
+
+    def _on_xscroll(self, first: str, last: str) -> None:
+        self._xscroll.set(first, last)
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self._xscroll.grid_remove()
+        else:
+            self._xscroll.grid()
 
     def _schedule_virtualize(self) -> None:
         if self._virtualize_after is None:
@@ -1517,10 +1582,10 @@ class InventoryOverview:
 
         top = max(0.0, float(self._canvas.canvasy(0)))
         bottom = top + max(1, self._canvas.winfo_height())
-        start = max(0, int(top // self.ROW_STRIDE) - self.VIEWPORT_BUFFER_ROWS)
+        start = max(0, int(top // self._row_stride) - self.VIEWPORT_BUFFER_ROWS)
         end = min(
             len(self._visible_campaigns),
-            int(bottom // self.ROW_STRIDE) + self.VIEWPORT_BUFFER_ROWS + 2,
+            int(bottom // self._row_stride) + self.VIEWPORT_BUFFER_ROWS + 2,
         )
         desired = set(self._visible_campaigns[start:end])
 
@@ -1559,7 +1624,13 @@ class InventoryOverview:
         self._schedule_virtualize()
 
     def _on_mousewheel(self, event: tk.Event[tk.Misc]):
-        self._wheel_delta += -1 if event.delta > 0 else 1
+        # FIX perso: Button-4/5 Linux n'ont pas de delta (== 0).
+        if getattr(event, "num", None) == 4:
+            self._wheel_delta += -1
+        elif getattr(event, "num", None) == 5:
+            self._wheel_delta += 1
+        else:
+            self._wheel_delta += -1 if event.delta > 0 else 1
         state: int = event.state if isinstance(event.state, int) else 0
         self._wheel_horizontal = bool(state & 1)
         if self._wheel_after is None:
@@ -1573,8 +1644,17 @@ class InventoryOverview:
             return
         delta = max(-8, min(8, delta))
         if self._wheel_horizontal:
+            first, last = self._canvas.xview()
+            if first <= 0.0 and last >= 1.0:
+                return
             self._canvas.xview_scroll(delta, "units")
         else:
+            # FIX: ignore la molette quand tout tient déjà à l'écran.
+            # Sinon le contenu descend dans du vide (la zone de scroll
+            # estimée dépasse la vraie hauteur des cartes).
+            first, last = self._canvas.yview()
+            if first <= 0.0 and last >= 1.0:
+                return
             self._canvas.yview_scroll(delta, "units")
         self._schedule_virtualize()
 
@@ -1606,10 +1686,10 @@ class InventoryOverview:
         )
         window = self._canvas.create_window(
             0,
-            row * self.ROW_STRIDE + self.CAMPAIGN_GAP // 2,
+            row * self._row_stride + self.CAMPAIGN_GAP // 2,
             anchor="nw",
             window=campaign_frame,
-            height=self.CAMPAIGN_HEIGHT,
+            height=self._row_stride - self.CAMPAIGN_GAP,
         )
         display["frame"] = campaign_frame
         display["window"] = window
@@ -1749,7 +1829,7 @@ class InventoryOverview:
                     setattr(benefit_label, "_image_ref", image)
 
             self._canvas.after_idle(
-                lambda frame=campaign_frame, gen=generation: self._measure_campaign_width(
+                lambda frame=campaign_frame, gen=generation: self._measure_campaign(
                     frame, gen
                 )
             )
@@ -1759,13 +1839,26 @@ class InventoryOverview:
             self._unrealize_campaign(campaign)
             raise
 
-    def _measure_campaign_width(self, frame: ttk.Frame, generation: int) -> None:
+    def _measure_campaign(self, frame: ttk.Frame, generation: int) -> None:
         if generation != self._generation or not frame.winfo_exists():
             return
         width = frame.winfo_reqwidth()
         if width > self._max_campaign_width:
             self._max_campaign_width = width
             self._canvas_update()
+        # FIX perso: les cartes plus hautes que l'estimation (ex. longue
+        # liste ACL) étaient coupées en bas (hauteur forcée). On élargit le
+        # pas uniformément pour que tout reste visible et positionnable.
+        height = frame.winfo_reqheight() + self.CAMPAIGN_GAP
+        if height > self._row_stride:
+            self._row_stride = height
+            for display in self._campaigns.values():
+                window = display["window"]
+                if window is not None:
+                    self._canvas.itemconfigure(
+                        window, height=self._row_stride - self.CAMPAIGN_GAP
+                    )
+            self._schedule_layout()
 
     def _unrealize_campaign(self, campaign: DropsCampaign) -> None:
         task = self._render_tasks.get(campaign)

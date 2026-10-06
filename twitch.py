@@ -1522,10 +1522,21 @@ class Twitch:
                 for cid in campaign_ids
             ]
         )
-        fetched_data: dict[str, JsonType] = {
-            (campaign_data := response_json["data"]["user"]["dropCampaign"])["id"]: campaign_data
-            for response_json in response_list
-        }
+        fetched_data: dict[str, JsonType] = {}
+        for response_json in response_list:
+            # FIX perso: si Twitch renvoie dropCampaign/user à null (champ gaté,
+            # campagne inéligible...), on ignore la campagne au lieu de crasher
+            # toute l'appli avec TypeError sur None["id"].
+            data = response_json.get("data") or {}
+            user = data.get("user") or {}
+            campaign_data = user.get("dropCampaign")
+            if not campaign_data or not campaign_data.get("id"):
+                logger.warning(
+                    "Skipping campaign details with null data "
+                    f"(keys: {list(response_json.keys())})"
+                )
+                continue
+            fetched_data[campaign_data["id"]] = campaign_data
         return self._merge_data(campaign_ids, fetched_data)
 
     async def fetch_campaign_catalog(self) -> dict[str, JsonType]:

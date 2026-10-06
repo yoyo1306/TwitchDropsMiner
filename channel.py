@@ -324,7 +324,13 @@ class Channel:
             match = re.search(SPADE_PATTERN, settings_js, re.I)
             if not match:
                 raise MinerException("Error while spade_url extraction: step #2")
-        return URLType(match.group(1))
+        spade_url = URLType(match.group(1))
+        # FIX perso 2026-10-05: spade.twitch.tv est sinkholé en 0.0.0.0 par
+        # certains DNS/adblockers -> connexion impossible en boucle.
+        # beacon.twitch.tv = même edge analytics Twitch et répond.
+        if "spade.twitch.tv" in spade_url:
+            spade_url = URLType(spade_url.replace("spade.twitch.tv", "beacon.twitch.tv"))
+        return spade_url
 
     def _check_drops_enabled(self, available_drops: list[JsonType]) -> bool:
         return any(
@@ -492,7 +498,14 @@ class Channel:
         if self._stream is None:
             return False
         if self._spade_url is None:
-            self._spade_url = await self.get_spade_url()
+            try:
+                self._spade_url = await self.get_spade_url()
+            except MinerException as exc:
+                # FIX perso: une extraction spade ratée (page changée, host
+                # bloqué...) ne doit pas tuer l'appli : on saute ce cycle,
+                # la prochaine tentative réessaiera l'extraction.
+                logger.warning(f"Spade URL extraction failed for {self._login}: {exc}")
+                return False
         try:
             async with self._twitch.request(
                 "POST", self._spade_url, data=self._stream.spade_payload

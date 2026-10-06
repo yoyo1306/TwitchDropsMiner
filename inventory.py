@@ -197,12 +197,16 @@ class BaseDrop:
                     {"input": {"dropInstanceID": self.claim_id}}
                 )
             )
-        except GQLException:
+        except GQLException as exc:
+            # FIX perso: log la vraie erreur (ex. integrity) au lieu de se
+            # taire, sinon un claim bloqué par Twitch est indiagnosticable.
+            logger.error(f"Drop claim GQL failed for {self.id}: {exc}")
             # regardless of the error, we have to assume
             # the claiming operation has potentially failed
             return False
         data = response["data"]
         if "errors" in data and data["errors"]:
+            logger.error(f"Drop claim returned errors for {self.id}: {data['errors']}")
             return False
         elif "claimDropRewards" in data:
             if not data["claimDropRewards"]:
