@@ -13,6 +13,22 @@ Correctifs personnels testés sur Windows 11. Pour réappliquer après un
 - `fetch_campaigns` : ignore les campagnes dont `dropCampaign` est `null`
   (champ gaté/inéligible) avec un warning, au lieu de crasher sur `None["id"]`.
 
+## Progression des drops (`channel.py`, `twitch.py`) — v2, 9 oct 2026
+Depuis le ~8 oct 2026, Twitch ne crédite plus les minutes envoyées par la seule
+télémétrie `minute-watched` (réponse 204 mais inventaire figé). Correctif porté
+de [rangermix/TwitchDropsMiner PR #164](https://github.com/rangermix/TwitchDropsMiner/pull/164)
+(issue [#163](https://github.com/rangermix/TwitchDropsMiner/issues/163)) :
+- Toutes les ~10 s : lecture de la playlist HLS de la chaîne regardée, puis
+  requête `HEAD` sur **chaque** nouveau segment (aucun flux audio/vidéo
+  téléchargé). Segments dédupliqués (cache borné à 256), URL de playlist
+  rafraîchie si expirée (401/403/404), requêtes bornées par des timeouts.
+- Playlist master parsée proprement (`#EXT-X-STREAM-INF`), au lieu de prendre
+  la dernière ligne brute de la réponse.
+- La télémétrie spade/beacon reste envoyée, au plus une fois par minute, mais
+  ne compte plus comme preuve de visionnage.
+- Plus d'estimation locale (`bump_minutes`) : la barre n'avance que sur une
+  confirmation Twitch (websocket ou `CurrentDrop`, vérifié ~1 fois par minute).
+
 ## Watch (`channel.py`)
 - `spade.twitch.tv` → `beacon.twitch.tv` : contourne les DNS/adblockers qui
   sinkholent `spade.twitch.tv` en `0.0.0.0` (même edge analytics Twitch).

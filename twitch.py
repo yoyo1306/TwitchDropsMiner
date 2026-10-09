@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import asyncio
 import logging
-from time import time
+from time import monotonic, time
 from copy import deepcopy
 from itertools import chain
 from functools import partial
@@ -964,27 +964,35 @@ class Twitch:
 
     async def _watch_sleep(self, delay: float) -> None:
         # we use wait_for here to allow an asyncio.sleep-like that can be ended prematurely
-        self._watching_restart.clear()
         with suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._watching_restart.wait(), timeout=delay)
+        self._watching_restart.clear()
 
     @task_wrapper(critical=True)
     async def _watch_loop(self) -> NoReturn:
         interval: float = WATCH_INTERVAL.total_seconds()
+        next_progress: float = monotonic() + 20
         while True:
             channel: Channel = await self.watching_channel.get()
             if not channel.online:
                 # if the channel isn't online anymore, we stop watching it
                 self.stop_watching()
                 continue
-            # logger.log(CALL, f"Sending watch payload to: {channel.name}")
+            stream = channel._stream
+            started: float = monotonic()
             succeeded: bool = await channel.send_watch()
-            last_sent: float = time()
             if not succeeded:
                 logger.log(CALL, f"Watch requested failed for channel: {channel.name}")
-            # wait ~20 seconds for a progress update
-            await asyncio.sleep(20)
-            if self.gui.progress.minute_almost_done():
+            # A ten-second poll fits inside Twitch's rolling segment window.
+            await self._watch_sleep(max(0.0, 10 - (monotonic() - started)))
+            if stream is None or not channel._watch_current(stream):
+                continue
+            if (
+                succeeded
+                and monotonic() >= next_progress
+                and self.gui.progress.minute_almost_done()
+            ):
+                next_progress = monotonic() + interval
                 # If the previous update was more than ~60s ago, and the progress tracker
                 # isn't counting down anymore, that means Twitch has temporarily
                 # stopped reporting drop's progress. To ensure the timer keeps at least somewhat
@@ -994,16 +1002,21 @@ class Twitch:
 
                 # Solution 1: use GQL to query for the currently mined drop status
                 try:
-                    context = await self.gql_request(
-                        GQL_QUERIES["CurrentDrop"].with_variables(
-                            {"channelID": str(channel.id)}
-                        )
+                    context = await asyncio.wait_for(
+                        self.gql_request(
+                            GQL_QUERIES["CurrentDrop"].with_variables(
+                                {"channelID": str(channel.id)}
+                            )
+                        ),
+                        timeout=5,
                     )
                     drop_data: JsonType | None = (
                         context["data"]["currentUser"]["dropCurrentSession"]
                     )
-                except GQLException:
+                except (GQLException, TimeoutError):
                     drop_data = None
+                if not channel._watch_current(stream):
+                    continue
                 if drop_data is not None:
                     gql_drop: TimedDrop | None = self._drops.get(drop_data["dropID"])
                     if gql_drop is not None and gql_drop.can_earn(channel):
@@ -1014,25 +1027,9 @@ class Twitch:
                         )
                         logger.log(CALL, f"Drop progress from GQL: {drop_text}")
                         handled = True
-
-                # Solution 2: If GQL fails, figure out which campaign we're most likely mining
-                # right now, and then bump up the minutes on it's drops
+                # Without a Twitch reading, the bar stays put: no local minute estimate.
                 if not handled:
-                    if (active_campaign := self.get_active_campaign(channel)) is not None:
-                        active_campaign.bump_minutes(channel)
-                        # NOTE: This usually gets overwritten below
-                        drop_text = f"Unknown drop ({active_campaign.game})"
-                        if (active_drop := active_campaign.first_drop) is not None:
-                            active_drop.display()
-                            drop_text = (
-                                f"{active_drop.name} ({active_drop.campaign.game}, "
-                                f"{active_drop.current_minutes}/{active_drop.required_minutes})"
-                            )
-                        logger.log(CALL, f"Drop progress from active search: {drop_text}")
-                        handled = True
-                    else:
-                        logger.log(CALL, "No active drop could be determined")
-            await self._watch_sleep(interval - min(time() - last_sent, interval))
+                    logger.log(CALL, "No drop progress reported by Twitch")
 
     @task_wrapper(critical=True)
     async def _maintenance_task(self) -> None:
