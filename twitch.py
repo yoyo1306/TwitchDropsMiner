@@ -1537,7 +1537,7 @@ class Twitch:
         The catalog is used only for public campaign metadata; authentication, inventory
         progress, websocket updates, watch events and claiming remain direct Twitch calls.
         """
-        catalog_url = "https://twitch-drops-api.sunkwi.com/v2/drops"
+        catalog_url = "https://drops.sunkwi.com/api/twitch/drops"
         request_kwargs: JsonType = {"headers": {"Accept": "application/json"}}
         if self.settings.proxy:
             request_kwargs["proxy"] = self.settings.proxy
@@ -1559,7 +1559,7 @@ class Twitch:
             logger.warning(f"Campaign catalog fallback failed: {exc}")
             return {}
 
-        groups = payload.get("data")
+        groups = payload.get("games")
         if not isinstance(groups, list):
             logger.warning("Campaign catalog fallback returned an invalid payload")
             return {}
@@ -1567,7 +1567,7 @@ class Twitch:
         # Reject materially stale snapshots instead of presenting campaigns that
         # may already have ended. The service advertises a 60-second refresh
         # interval, but allow a generous grace period for transient delays.
-        last_updated_raw = payload.get("lastUpdatedAt")
+        last_updated_raw = payload.get("refreshedAt")
         refresh_interval = payload.get("refreshIntervalSeconds", 60)
         try:
             refresh_seconds = max(1, int(refresh_interval))
